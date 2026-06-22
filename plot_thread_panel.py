@@ -3,7 +3,7 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
     QFrame, QGridLayout, QComboBox, QMessageBox, QMenu, QTextEdit,
-    QListWidget, QListWidgetItem, QSplitter, QGroupBox
+    QListWidget, QListWidgetItem, QSplitter, QGroupBox, QDialog
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont, QAction
@@ -37,10 +37,17 @@ THREAD_STATUS_COLORS = {
 
 # 关系类型
 RELATION_TYPE_NAMES = {
-    0: "埋设",
-    1: "推进",
-    2: "回收",
+    0: "起始事件",
+    1: "终止事件",
+    2: "经过事件",
     3: "提及",
+}
+
+RELATION_TYPE_COLORS = {
+    0: "#10B981",
+    1: "#EF4444",
+    2: "#3B82F6",
+    3: "#9CA3AF",
 }
 
 
@@ -324,15 +331,60 @@ class ThreadDetailPanel(QWidget):
         self.events_list.clear()
         events = self.db.get_thread_events(thread_id)
         
+        if not events:
+            item = QListWidgetItem("暂无关联事件")
+            item.setStyleSheet("color: #6B7280; font-style: italic;")
+            self.events_list.addItem(item)
+            return
+        
+        start_event = None
+        end_event = None
+        middle_events = []
+        
         for ev in events:
-            rel_type = RELATION_TYPE_NAMES.get(ev.get('relation_type', 0), "埋设")
-            timestamp = ev.get('timestamp', '')
-            title = ev.get('title', '')
-            char_name = ev.get('character_name', '')
-            
-            item_text = f"[{rel_type}] {timestamp} - {title} ({char_name})"
+            rel_type = ev.get('relation_type', 0)
+            if rel_type == 0:
+                start_event = ev
+            elif rel_type == 1:
+                end_event = ev
+            elif rel_type == 2:
+                middle_events.append(ev)
+        
+        if start_event:
+            rel_name = RELATION_TYPE_NAMES.get(0, "起始事件")
+            color = RELATION_TYPE_COLORS.get(0, "#10B981")
+            timestamp = start_event.get('timestamp', '')
+            title = start_event.get('title', '')
+            char_name = start_event.get('character_name', '')
+            item_text = f"📌 {rel_name}: [{timestamp}] {title} ({char_name})"
             item = QListWidgetItem(item_text)
-            item.setData(Qt.UserRole, ev['event_id'])
+            item.setStyleSheet(f"color: {color}; font-weight: bold;")
+            item.setData(Qt.UserRole, start_event['event_id'])
+            self.events_list.addItem(item)
+        
+        if middle_events:
+            for ev in middle_events:
+                rel_name = RELATION_TYPE_NAMES.get(2, "经过事件")
+                color = RELATION_TYPE_COLORS.get(2, "#3B82F6")
+                timestamp = ev.get('timestamp', '')
+                title = ev.get('title', '')
+                char_name = ev.get('character_name', '')
+                item_text = f"➡️ [{timestamp}] {title} ({char_name})"
+                item = QListWidgetItem(item_text)
+                item.setStyleSheet(f"color: {color};")
+                item.setData(Qt.UserRole, ev['event_id'])
+                self.events_list.addItem(item)
+        
+        if end_event:
+            rel_name = RELATION_TYPE_NAMES.get(1, "终止事件")
+            color = RELATION_TYPE_COLORS.get(1, "#EF4444")
+            timestamp = end_event.get('timestamp', '')
+            title = end_event.get('title', '')
+            char_name = end_event.get('character_name', '')
+            item_text = f"🏁 {rel_name}: [{timestamp}] {title} ({char_name})"
+            item = QListWidgetItem(item_text)
+            item.setStyleSheet(f"color: {color}; font-weight: bold;")
+            item.setData(Qt.UserRole, end_event['event_id'])
             self.events_list.addItem(item)
     
     def _add_event_link(self):

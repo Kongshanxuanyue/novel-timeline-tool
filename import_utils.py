@@ -44,13 +44,39 @@ def import_from_json(parent, db):
     if 'organizations' in data:
         for org_data in data['organizations']:
             try:
-                org_id = db.create_organization(
-                    name=org_data.get('name', ''),
-                    description=org_data.get('description'),
-                    color=org_data.get('color')
-                )
-                id_maps['organizations'][org_data['id']] = org_id
-                import_stats['organizations'] += 1
+                org_name = org_data.get('name', '')
+                # 检查是否存在同名组织，存在则合并
+                existing_org = None
+                if org_name:
+                    existing_org = db.get_organization_by_name(org_name)
+
+                if existing_org:
+                    # 同名合并：使用现有组织ID
+                    org_id = existing_org['id']
+                    id_maps['organizations'][org_data['id']] = org_id
+                    import_stats['organizations_merged'] = import_stats.get('organizations_merged', 0) + 1
+
+                    # 更新字段（仅在新值存在且原值为空时）
+                    updates = {}
+                    if org_data.get('description') and not existing_org.get('description'):
+                        updates['description'] = org_data.get('description')
+                    if org_data.get('color') and not existing_org.get('color'):
+                        updates['color'] = org_data.get('color')
+
+                    if updates:
+                        try:
+                            db.update_organization(org_id, **updates)
+                        except Exception as e:
+                            print(f"合并组织字段失败: {e}")
+                else:
+                    # 创建新组织
+                    org_id = db.create_organization(
+                        name=org_name,
+                        description=org_data.get('description'),
+                        color=org_data.get('color')
+                    )
+                    id_maps['organizations'][org_data['id']] = org_id
+                    import_stats['organizations'] += 1
             except Exception as e:
                 print(f"导入组织失败: {e}")
     
@@ -77,19 +103,60 @@ def import_from_json(parent, db):
                 # 映射组织ID
                 old_org_id = char_data.get('organization_id')
                 new_org_id = id_maps['organizations'].get(old_org_id) if old_org_id else None
-                
-                char_id = db.create_character(
-                    name=char_data.get('name', ''),
-                    alias=char_data.get('alias'),
-                    description=char_data.get('description'),
-                    organization_id=new_org_id,
-                    color=char_data.get('color'),
-                    birth_time=char_data.get('birth_time'),
-                    death_time=char_data.get('death_time'),
-                    biography=char_data.get('biography', '')
-                )
-                id_maps['characters'][char_data['id']] = char_id
-                import_stats['characters'] += 1
+
+                # 合并biography到description中存储
+                biography = char_data.get('biography', '')
+                description = char_data.get('description', '')
+                if biography:
+                    if description:
+                        description = description + '\n\n【传记】\n' + biography
+                    else:
+                        description = '【传记】\n' + biography
+
+                # 检查是否存在同名人物，存在则合并
+                char_name = char_data.get('name', '')
+                existing_char = None
+                if char_name:
+                    existing_char = db.get_character_by_name(char_name)
+
+                if existing_char:
+                    # 同名合并：更新字段（仅在新值存在时覆盖）
+                    char_id = existing_char['id']
+                    id_maps['characters'][char_data['id']] = char_id
+                    import_stats['characters_merged'] += 1
+
+                    updates = {}
+                    if char_data.get('alias') and not existing_char.get('alias'):
+                        updates['alias'] = char_data.get('alias')
+                    if description and not existing_char.get('description'):
+                        updates['description'] = description
+                    if new_org_id and not existing_char.get('organization_id'):
+                        updates['organization_id'] = new_org_id
+                    if char_data.get('color') and not existing_char.get('color'):
+                        updates['color'] = char_data.get('color')
+                    if char_data.get('birth_time') and not existing_char.get('birth_time'):
+                        updates['birth_time'] = char_data.get('birth_time')
+                    if char_data.get('death_time') and not existing_char.get('death_time'):
+                        updates['death_time'] = char_data.get('death_time')
+
+                    if updates:
+                        try:
+                            db.update_character(char_id, **updates)
+                        except Exception as e:
+                            print(f"合并人物字段失败: {e}")
+                else:
+                    # 创建新人物
+                    char_id = db.create_character(
+                        name=char_name,
+                        alias=char_data.get('alias'),
+                        description=description,
+                        organization_id=new_org_id,
+                        color=char_data.get('color'),
+                        birth_time=char_data.get('birth_time'),
+                        death_time=char_data.get('death_time')
+                    )
+                    id_maps['characters'][char_data['id']] = char_id
+                    import_stats['characters'] += 1
             except Exception as e:
                 print(f"导入人物失败: {e}")
     
@@ -102,24 +169,44 @@ def import_from_json(parent, db):
                 new_char_id = id_maps['characters'].get(old_char_id)
                 if not new_char_id:
                     continue
-                
+
                 # 映射章节ID
                 old_chapter_id = event_data.get('chapter_id')
                 new_chapter_id = id_maps['chapters'].get(old_chapter_id) if old_chapter_id else None
-                
+
+                # 检查同人物下是否已有同名事件，存在则跳过
+                event_title = event_data.get('title', '')
+                event_timestamp = event_data.get('timestamp', '')
+                if event_title and new_char_id:
+                    existing_event = db.get_event_by_title_and_character(
+                        event_title, new_char_id, event_timestamp
+                    )
+                    if existing_event:
+                        # 同名事件已存在，记录映射并跳过
+                        if 'id' in event_data:
+                            id_maps['events'][event_data['id']] = existing_event['id']
+                        import_stats['events_merged'] = import_stats.get('events_merged', 0) + 1
+                        continue
+
                 event_id = db.create_event(
                     character_id=new_char_id,
-                    timestamp=event_data.get('timestamp', ''),
-                    title=event_data.get('title', ''),
+                    timestamp=event_timestamp,
+                    title=event_title,
                     content=event_data.get('content'),
-                    event_type=event_data.get('type', 0),
+                    type=event_data.get('type', 0),
                     color=event_data.get('color', '#10B981'),
-                    tags=event_data.get('tags'),
-                    chapter_number=event_data.get('chapter_number'),
-                    chapter_title=event_data.get('chapter_title'),
-                    writing_status=event_data.get('writing_status', 0)
+                    tags=event_data.get('tags')
                 )
-                id_maps['events'][event_data['id']] = event_id
+                # 单独设置写作状态
+                writing_status = event_data.get('writing_status', 0)
+                if writing_status and writing_status != 0:
+                    try:
+                        db.update_event_writing_status(event_id, writing_status)
+                    except Exception:
+                        pass
+                # 只在有id字段时记录映射
+                if 'id' in event_data:
+                    id_maps['events'][event_data['id']] = event_id
                 import_stats['events'] += 1
             except Exception as e:
                 print(f"导入事件失败: {e}")

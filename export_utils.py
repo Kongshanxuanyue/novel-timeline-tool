@@ -143,37 +143,8 @@ def collect_filtered_data(db, options):
             'organization_id': ch.get('organization_id'),
             'color': ch.get('color'),
             'birth_time': ch.get('birth_time'),
-            'death_time': ch.get('death_time'),
-            'events': []
+            'death_time': ch.get('death_time')
         }
-        events = db.get_events_by_character(ch['id'])
-        for ev in events:
-            ev_type = ev.get('type', 0)
-            if event_types and ev_type not in event_types:
-                continue
-
-            ev_time_val = parse_time_value(ev['timestamp'])
-            if ev_time_val < start_val or ev_time_val > end_val:
-                continue
-
-            event_data = {
-                'id': ev['id'],
-                'timestamp': ev['timestamp'],
-                'title': ev['title'],
-                'type': ev_type,
-                'color': ev.get('color', '#10B981'),
-                'content': ev.get('content')
-            }
-            char_data['events'].append(event_data)
-            data['events'].append({
-                'character_id': ch['id'],
-                'character_name': ch['name'],
-                'timestamp': ev['timestamp'],
-                'title': ev['title'],
-                'type': ev_type,
-                'color': ev.get('color', '#10B981'),
-                'content': ev.get('content')
-            })
         data['characters'].append(char_data)
 
     return data

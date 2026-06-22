@@ -173,6 +173,12 @@ class EventNodeItem(QGraphicsItem):
         title_y = 12 + self.title_height / 2
         painter.drawText(title_x, title_y, self.title_text)
 
+from collections import defaultdict
+import re
+from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QMenu
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPen, QColor, QFont, QWheelEvent
+
 class VirtualTimelineCanvas(QGraphicsView):
     node_selected = Signal(dict)
     character_selected = Signal(int, str)  # character_id, character_name
@@ -206,8 +212,7 @@ class VirtualTimelineCanvas(QGraphicsView):
 
         # 对齐相关
         self.align_events = True  # 默认启用对齐
-        self.TIMESTAMP_SCALE = 25.0
-        self.NODE_SPACING = 20  # 同时间节点之间的水平间距
+        self.NODE_SPACING = 30  # 同一时间多个事件并排时的节点间距
 
         # 右键菜单
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -218,44 +223,166 @@ class VirtualTimelineCanvas(QGraphicsView):
         # 缩放相关
         self.min_scale = 0.25
         self.max_scale = 1.5
-        
-        # 框选相关
-        self.rubber_band_active = False
-        self.selected_event_ids = []
 
+    # ==================== 核心：动态弹性布局 ====================
+    def recalculate_layout(self):
+        """重新计算所有节点的X坐标（非线性动态弹性间距），彻底解决重叠与过度留白 [cite: 16]"""
+        if not self.all_nodes and not self.character_lines:
+            return
+            
+        time_dict = {}
+        
+        # 1. 收集所有事件的时间点
+        for node in self.all_nodes:
+            ts = node.data.get('timestamp', 0)
+            if isinstance(ts, str) and re.match(r'第?\d+年\d+月\d+日', ts):
+                time_val = parse_time_to_value(ts)
+            else:
+                try: time_val = float(ts) * 10000
+                except: time_val = 0
+            
+            if time_val not in time_dict:
+                time_dict[time_val] = []
+            time_dict[time_val].append(node)
+            
+        # 2. 收集所有人物的出生和死亡时间（确保即使没有事件，线也能画出来）
+        for char_info in self.character_lines.values():
+            if char_info.get('birth_time'):
+                t = parse_time_to_value(char_info['birth_time'])
+                if t not in time_dict: time_dict[t] = []
+            if char_info.get('death_time'):
+                t = parse_time_to_value(char_info['death_time'])
+                if t not in time_dict: time_dict[t] = []
+
+        if not time_dict:
+            return
+
+        sorted_times = sorted(time_dict.keys())
+        
+        # 3. 动态计算映射的 X 坐标
+        time_x_map = {}
+        current_x = self.LINE_START_X + 80  # 初始左侧偏移
+        
+        MIN_SPACING = 150       # 最小安全间距：保证无论多近的时间，文字框都不会重叠
+        MAX_EXTRA_SPACING = 300 # 最大额外留白：哪怕相隔几百年，最多也只增加这么多像素
+        
+        time_x_map[sorted_times[0]] = current_x
+        
+        for i in range(1, len(sorted_times)):
+            delta_time = sorted_times[i] - sorted_times[i-1]
+            # 假设 1年(数值为10000) 增加 20 像素的距离感
+            extra_spacing = min(MAX_EXTRA_SPACING, (delta_time / 10000.0) * 20)
+            current_x += MIN_SPACING + extra_spacing
+            time_x_map[sorted_times[i]] = current_x
+            
+        # 4. 应用坐标，处理同一时间的节点对齐
+        max_x = current_x
+        for time_val, nodes in time_dict.items():
+            if not nodes: continue
+            base_x = time_x_map[time_val]
+            
+            if len(nodes) <= 1 or not self.align_events:
+                # 只有一个节点，或者关闭了对齐功能
+                for node in nodes:
+                    node.x_pos = base_x
+                    node.data['base_x'] = base_x
+                    node.setPos(base_x, node.y_pos)
+            else:
+                # 开启对齐：同一时间的事件错开显示
+                total_w = (len(nodes) - 1) * self.NODE_SPACING
+                start_x = base_x - total_w / 2
+                for i, node in enumerate(nodes):
+                    node.x_pos = start_x + i * self.NODE_SPACING
+                    node.data['base_x'] = node.x_pos
+                    node.setPos(node.x_pos, node.y_pos)
+                    max_x = max(max_x, node.x_pos)
+                    
+        # 5. 统一更新人物背景轴线与生命线
+        line_end_x = max_x + 200
+        for char_id, char_info in self.character_lines.items():
+            line_item = char_info['line']
+            line_item.setLine(self.LINE_START_X, char_info['y_pos'], line_end_x, char_info['y_pos'])
+            
+            if 'life_line' in char_info:
+                birth_val = parse_time_to_value(char_info['birth_time'])
+                death_val = parse_time_to_value(char_info['death_time'])
+                
+                # 为出生/死亡进行坐标插值
+                birth_x = self._interpolate_x(birth_val, sorted_times, time_x_map)
+                death_x = self._interpolate_x(death_val, sorted_times, time_x_map)
+                char_info['life_line'].setLine(birth_x, char_info['y_pos'], death_x, char_info['y_pos'])
+                
+        # 6. 更新章节分割线
+        self._update_chapter_dividers(sorted_times, time_x_map)
+        
+        # 7. 更新画布可视区域
+        scene_height = max(self.next_y_offset + 100, 800)
+        self.scene.setSceneRect(0, 0, line_end_x, scene_height)
+
+    def _interpolate_x(self, time_val, sorted_times, time_x_map):
+        """为没有独立事件的时间点计算插值X坐标 [cite: 16]"""
+        if not sorted_times: return self.LINE_START_X
+        if time_val in time_x_map: return time_x_map[time_val]
+        if time_val <= sorted_times[0]: return self.LINE_START_X + 20
+        if time_val >= sorted_times[-1]: return time_x_map[sorted_times[-1]] + 100
+        
+        for i in range(len(sorted_times) - 1):
+            t1, t2 = sorted_times[i], sorted_times[i+1]
+            if t1 < time_val < t2:
+                x1, x2 = time_x_map[t1], time_x_map[t2]
+                ratio = (time_val - t1) / (t2 - t1)
+                return x1 + (x2 - x1) * ratio
+        return self.LINE_START_X
+
+    def _update_chapter_dividers(self, sorted_times, time_x_map):
+        """基于新的动态坐标体系重绘章节分割线 [cite: 16]"""
+        for div in self.chapter_dividers.values():
+            self.scene.removeItem(div['line'])
+            self.scene.removeItem(div['label'])
+        self.chapter_dividers.clear()
+        
+        chapter_times = {}
+        for node in self.all_nodes:
+            ch_num = node.data.get('chapter_number')
+            if ch_num:
+                ts = node.data.get('timestamp', 0)
+                if isinstance(ts, str) and re.match(r'第?\d+年\d+月\d+日', ts):
+                    time_val = parse_time_to_value(ts)
+                else:
+                    try: time_val = float(ts) * 10000
+                    except: time_val = 0
+                    
+                if ch_num not in chapter_times:
+                    chapter_times[ch_num] = {'min': time_val, 'title': node.data.get('chapter_title', '')}
+                else:
+                    chapter_times[ch_num]['min'] = min(chapter_times[ch_num]['min'], time_val)
+                    
+        for ch_num, ch_info in chapter_times.items():
+            x_pos = self._interpolate_x(ch_info['min'], sorted_times, time_x_map)
+            
+            divider_pen = QPen(QColor("#4B5563"), 2, Qt.DashLine)
+            line_item = self.scene.addLine(x_pos, 50, x_pos, self.next_y_offset + 50, divider_pen)
+            line_item.setZValue(-20)
+            
+            label_text = f"第{ch_num}章"
+            if ch_info['title']:
+                label_text += f" {ch_info['title'][:10]}"
+            label_item = self.scene.addText(label_text, QFont("Microsoft YaHei", 9, QFont.Bold))
+            label_item.setDefaultTextColor(QColor("#374151"))
+            label_item.setPos(x_pos + 5, 30)
+            label_item.setZValue(5)
+            
+            self.chapter_dividers[ch_num] = {'line': line_item, 'label': label_item, 'x_pos': x_pos}
+
+    # ==================== 生命周期与交互管理 ====================
     def load_timeline_data(self, characters_with_events: list):
+        """全量加载人物和事件数据 [cite: 16]"""
         self.scene.clear()
         self.all_nodes.clear()
         self.character_lines.clear()
         self.character_name_items.clear()
         self.organization_boxes = {}
 
-        all_time_values = []
-        for ch in characters_with_events:
-            birth_time = ch.get('birth_time')
-            death_time = ch.get('death_time')
-            if birth_time:
-                all_time_values.append(parse_time_to_value(birth_time))
-            if death_time:
-                all_time_values.append(parse_time_to_value(death_time))
-            for ev in ch['events']:
-                timestamp = ev.get('timestamp', 0)
-                if isinstance(timestamp, str) and re.match(r'第?\d+年\d+月\d+日', str(timestamp)):
-                    all_time_values.append(parse_time_to_value(timestamp))
-                else:
-                    all_time_values.append(float(timestamp) * 10000)
-
-        if all_time_values:
-            self.min_time_value = min(all_time_values)
-            self.max_time_value = max(all_time_values)
-            time_range = self.max_time_value - self.min_time_value
-            # 只扩展右侧，左侧保持最早时间位置（避免负数偏移）
-            self.max_time_value += time_range * 0.15
-        else:
-            self.min_time_value = 0
-            self.max_time_value = 1000000
-
-        from collections import defaultdict
         org_groups = defaultdict(list)
         for ch in characters_with_events:
             org_id = ch.get('org_id', 0)
@@ -263,28 +390,17 @@ class VirtualTimelineCanvas(QGraphicsView):
 
         self.next_y_offset = 100
         for org_id, org_chars in org_groups.items():
-            org_color = None
-            if org_chars[0].get('org_color'):
-                org_color = org_chars[0]['org_color']
-
+            org_color = org_chars[0].get('org_color') if org_chars[0].get('org_color') else None
             org_start_y = self.next_y_offset
 
             for ch in org_chars:
                 ch_id = ch.get('id', len(self.character_lines) + 1)
-                birth_time = ch.get('birth_time')
-                death_time = ch.get('death_time')
-                self._add_character_to_scene(ch_id, ch['name'], self.next_y_offset, birth_time, death_time, org_color)
+                self._add_character_to_scene(ch_id, ch['name'], self.next_y_offset, ch.get('birth_time'), ch.get('death_time'), org_color)
 
                 for ev in ch['events']:
                     ev = dict(ev)
                     ev['character_id'] = ch_id
-                    timestamp = ev.get('timestamp', 0)
-                    if isinstance(timestamp, str) and re.match(r'第?\d+年\d+月\d+日', str(timestamp)):
-                        time_value = parse_time_to_value(timestamp)
-                        ev['base_x'] = self.LINE_START_X + (time_value - self.min_time_value) * 0.0025
-                    else:
-                        time_value = float(timestamp) * 10000
-                        ev['base_x'] = self.LINE_START_X + (time_value - self.min_time_value) * 0.0025
+                    ev['base_x'] = 0  # 坐标由 recalculate_layout 统一分配
                     node = EventNodeItem(ev, self.next_y_offset)
                     self.scene.addItem(node)
                     self.all_nodes.append(node)
@@ -303,124 +419,47 @@ class VirtualTimelineCanvas(QGraphicsView):
                 org_box_rect.setZValue(-15)
                 self.organization_boxes[org_id] = org_box_rect
 
-        # 绘制章节分隔线
-        self._draw_chapter_dividers()
-
-        if self.align_events:
-            self.align_synchronized_events()
-
-        # 设置场景矩形（确保时间轴正确显示，1.2倍时间轴）
-        scene_width = self.LINE_START_X + (self.max_time_value - self.min_time_value) * 0.0025 + 200
-        scene_height = max(self.next_y_offset + 100, 800)
-        self.scene.setSceneRect(0, 0, scene_width, scene_height)
-
+        self.recalculate_layout()
         self.update_viewport_virtualization()
-    
-    def _draw_chapter_dividers(self):
-        """绘制章节分隔线"""
-        self.chapter_dividers.clear()
-        
-        # 收集所有事件的章节信息
-        chapter_times = {}
-        for node in self.all_nodes:
-            ch_num = node.data.get('chapter_number')
-            if ch_num:
-                timestamp = node.data.get('timestamp', 0)
-                if isinstance(timestamp, str) and re.match(r'第?\d+年\d+月\d+日', timestamp):
-                    time_value = parse_time_to_value(timestamp)
-                else:
-                    time_value = float(timestamp) * 10000
-                
-                if ch_num not in chapter_times:
-                    chapter_times[ch_num] = {'min': time_value, 'max': time_value, 'title': node.data.get('chapter_title', '')}
-                else:
-                    chapter_times[ch_num]['min'] = min(chapter_times[ch_num]['min'], time_value)
-                    chapter_times[ch_num]['max'] = max(chapter_times[ch_num]['max'], time_value)
-        
-        # 按章节号排序绘制分隔线
-        for ch_num in sorted(chapter_times.keys()):
-            ch_info = chapter_times[ch_num]
-            # 在章节开始位置绘制分隔线
-            x_pos = self.LINE_START_X + (ch_info['min'] - self.min_time_value) * 0.0025
-            
-            # 绘制垂直虚线
-            divider_pen = QPen(QColor("#4B5563"), 2, Qt.DashLine)
-            line_item = self.scene.addLine(x_pos, 50, x_pos, self.next_y_offset + 50, divider_pen)
-            line_item.setZValue(-20)
-            
-            # 添加章节标签
-            label_text = f"第{ch_num}章"
-            if ch_info['title']:
-                label_text += f" {ch_info['title'][:10]}"
-            label_item = self.scene.addText(label_text, QFont("Microsoft YaHei", 9, QFont.Bold))
-            label_item.setDefaultTextColor(QColor("#374151"))
-            label_item.setPos(x_pos + 5, 30)
-            label_item.setZValue(5)
-            
-            self.chapter_dividers[ch_num] = {'line': line_item, 'label': label_item, 'x_pos': x_pos}
 
-    def align_synchronized_events(self):
-        """将相同时间戳的事件竖向对齐"""
-        from collections import defaultdict
+    def append_character_timeline(self, character_data):
+        """追加单个角色轴线 [cite: 16]"""
+        ch_id = character_data.get('id')
+        if ch_id in self.character_lines:
+            return False
 
-        timestamp_groups = defaultdict(list)
-        for node in self.all_nodes:
-            ts = node.data.get('timestamp', 0)
-            timestamp_groups[ts].append(node)
+        self._add_character_to_scene(ch_id, character_data.get('name', ''), self.next_y_offset, 
+                                     character_data.get('birth_time'), character_data.get('death_time'), 
+                                     character_data.get('org_color'))
 
-        for ts, nodes in timestamp_groups.items():
-            if isinstance(ts, str) and re.match(r'第?\d+年\d+月\d+日', ts):
-                time_value = parse_time_to_value(ts)
-            else:
-                try:
-                    time_value = float(ts) * 10000
-                except:
-                    time_value = 0
+        for ev in character_data.get('events', []):
+            ev = dict(ev)
+            ev['character_id'] = ch_id
+            ev['base_x'] = 0 
+            node = EventNodeItem(ev, self.next_y_offset)
+            self.scene.addItem(node)
+            self.all_nodes.append(node)
 
-            center_x = self.LINE_START_X + (time_value - self.min_time_value) * 0.0025
-
-            if len(nodes) <= 1:
-                for node in nodes:
-                    node.x_pos = center_x
-                    node.setPos(center_x, node.y_pos)
-            else:
-                total_width = (len(nodes) - 1) * self.NODE_SPACING
-                start_x = center_x - total_width / 2
-
-                for i, node in enumerate(nodes):
-                    node.x_pos = start_x + i * self.NODE_SPACING
-                    node.setPos(node.x_pos, node.y_pos)
+        self.next_y_offset += 160
+        self.recalculate_layout()
+        self.update_viewport_virtualization()
+        return True
 
     def set_align_events(self, enabled: bool):
-        """设置是否启用事件对齐"""
+        """开关同一时间节点的竖向规避对齐 [cite: 16]"""
         self.align_events = enabled
-        if enabled:
-            self.align_synchronized_events()
-        else:
-            # 恢复原始位置
-            for node in self.all_nodes:
-                timestamp = node.data.get('timestamp', 0)
-                if isinstance(timestamp, str) and re.match(r'第?\d+年\d+月\d+日', str(timestamp)):
-                    time_value = parse_time_to_value(timestamp)
-                    base_x = node.data.get('base_x', self.LINE_START_X + (time_value - self.min_time_value) * 0.0025)
-                else:
-                    base_x = node.data.get('base_x', self.LINE_START_X + float(timestamp) * self.TIMESTAMP_SCALE)
-                node.x_pos = base_x
-                node.setPos(base_x, node.y_pos)
+        self.recalculate_layout()
         self.update_viewport_virtualization()
 
     def _add_character_to_scene(self, character_id, name, y_offset, birth_time=None, death_time=None, org_color=None):
-        # 人物图标和名字固定在左边（时间轴左侧固定区域）
+        """绘制角色基础轴线与名称 [cite: 16]"""
         name_item = self.scene.addText(f"👤 {name}", QFont("Microsoft YaHei", 10, QFont.Bold))
         name_item.setDefaultTextColor(QColor("#1F2937"))
         name_item.setPos(10, y_offset - 32)
         name_item.setZValue(10)
 
-        # 绘制时间线（从 150 开始，给左侧留出名字空间）
-        line_start_x = 150
-        # 根据最大时间值动态计算线条结束位置（1.2倍时间轴）
-        line_end_x = line_start_x + (self.max_time_value - self.min_time_value) * 0.0025 + 100
-        line_item = self.scene.addLine(line_start_x, y_offset, line_end_x, y_offset, QPen(QColor("#E5E7EB"), 2, Qt.SolidLine))
+        # 初始赋虚假长度，会在 recalculate_layout 修复
+        line_item = self.scene.addLine(self.LINE_START_X, y_offset, self.LINE_START_X + 100, y_offset, QPen(QColor("#E5E7EB"), 2, Qt.SolidLine))
         line_item.setZValue(-10)
 
         char_info = {
@@ -432,13 +471,9 @@ class VirtualTimelineCanvas(QGraphicsView):
             'org_color': org_color
         }
 
-        # 绘制生命线（出生到死亡之间的高亮）
         if birth_time is not None and death_time is not None:
-            birth_value = parse_time_to_value(birth_time)
-            death_value = parse_time_to_value(death_time)
             life_line = self.scene.addLine(
-                line_start_x + (birth_value - self.min_time_value) * 0.0025, y_offset,
-                line_start_x + (death_value - self.min_time_value) * 0.0025, y_offset,
+                self.LINE_START_X, y_offset, self.LINE_START_X + 100, y_offset,
                 QPen(QColor("#10B981"), 3, Qt.SolidLine)
             )
             life_line.setZValue(-5)
@@ -447,17 +482,6 @@ class VirtualTimelineCanvas(QGraphicsView):
         self.character_lines[character_id] = char_info
         self.character_name_items[character_id] = name_item
 
-        # 更新事件节点的 X 起始位置
-        self.LINE_START_X = line_start_x
-
-    def add_character(self, character_id, name, birth_time=None, death_time=None, org_color=None):
-        if character_id in self.character_lines:
-            return
-
-        self._add_character_to_scene(character_id, name, self.next_y_offset, birth_time, death_time, org_color)
-        self.next_y_offset += 160
-        self.update_viewport_virtualization()
-
     def add_event(self, character_id, event_data):
         if character_id not in self.character_lines:
             return
@@ -465,22 +489,13 @@ class VirtualTimelineCanvas(QGraphicsView):
         y_offset = self.character_lines[character_id]['y_pos']
         event_data = dict(event_data)
         event_data['character_id'] = character_id
-        
-        timestamp = event_data.get('timestamp', 0)
-        if isinstance(timestamp, str) and re.match(r'第?\d+年\d+月\d+日', timestamp):
-            time_value = parse_time_to_value(timestamp)
-            event_data['base_x'] = self.LINE_START_X + (time_value - self.min_time_value) * 0.0025
-        else:
-            time_value = float(timestamp) * 10000
-            event_data['base_x'] = self.LINE_START_X + (time_value - self.min_time_value) * 0.0025
+        event_data['base_x'] = 0
         
         node = EventNodeItem(event_data, y_offset)
         self.scene.addItem(node)
         self.all_nodes.append(node)
 
-        if self.align_events:
-            self.align_synchronized_events()
-
+        self.recalculate_layout()
         self.update_viewport_virtualization()
 
     def get_character_y_offset(self, character_id):
@@ -489,166 +504,68 @@ class VirtualTimelineCanvas(QGraphicsView):
         return None
 
     def select_event(self, event_id):
-        """选中指定事件节点"""
         for node in self.all_nodes:
             if node.data.get('id') == event_id:
-                # 清除其他选中状态
                 for n in self.all_nodes:
                     n.setSelected(False)
                 node.setSelected(True)
-                # 居中显示
                 self.centerOn(node.x_pos, node.y_pos)
                 return True
         return False
 
     def remove_event(self, event_id):
-        """从画布中移除指定事件节点"""
         for node in self.all_nodes:
             if node.data.get('id') == event_id:
                 self.scene.removeItem(node)
                 self.all_nodes.remove(node)
-                if self.align_events:
-                    self.align_synchronized_events()
+                self.recalculate_layout()
                 self.update_viewport_virtualization()
                 return True
         return False
 
     def remove_character(self, character_id):
-        """从画布中移除指定人物及其所有事件节点"""
         if character_id not in self.character_lines:
             return False
 
         char_info = self.character_lines[character_id]
 
-        # 移除该人物的所有事件节点
         nodes_to_remove = [node for node in self.all_nodes if node.data.get('character_id') == character_id]
         for node in nodes_to_remove:
             self.scene.removeItem(node)
             if node in self.all_nodes:
                 self.all_nodes.remove(node)
 
-        # 移除轴线
         self.scene.removeItem(char_info['line'])
 
-        # 移除生命线
         if 'life_line' in char_info:
             self.scene.removeItem(char_info['life_line'])
 
-        # 移除名字
         self.scene.removeItem(self.character_name_items[character_id])
 
-        # 清理字典
         del self.character_lines[character_id]
         del self.character_name_items[character_id]
 
-        if self.align_events:
-            self.align_synchronized_events()
+        if self.character_lines:
+            max_y = max(info['y_pos'] for info in self.character_lines.values())
+            self.next_y_offset = max_y + 160
+        else:
+            self.next_y_offset = 80
 
+        self.recalculate_layout()
         self.update_viewport_virtualization()
         return True
 
-    def append_character_timeline(self, character_data):
-        """追加人物时间轴（不清空现有内容）"""
-        ch_id = character_data.get('id')
-        if ch_id in self.character_lines:
-            return False
-
-        ch_name = character_data.get('name', '')
-        birth_time = character_data.get('birth_time')
-        death_time = character_data.get('death_time')
-        org_color = character_data.get('org_color')
-
-        # 更新时间范围
-        new_time_values = []
-        if birth_time:
-            new_time_values.append(parse_time_to_value(birth_time))
-        if death_time:
-            new_time_values.append(parse_time_to_value(death_time))
-        for ev in character_data.get('events', []):
-            timestamp = ev.get('timestamp', 0)
-            if isinstance(timestamp, str) and re.match(r'第?\d+年\d+月\d+日', str(timestamp)):
-                new_time_values.append(parse_time_to_value(timestamp))
-            else:
-                new_time_values.append(float(timestamp) * 10000)
-
-        if new_time_values:
-            if hasattr(self, 'min_time_value'):
-                self.min_time_value = min(self.min_time_value, min(new_time_values))
-                self.max_time_value = max(self.max_time_value, max(new_time_values))
-            else:
-                self.min_time_value = min(new_time_values)
-                self.max_time_value = max(new_time_values)
-
-            time_range = self.max_time_value - self.min_time_value
-            # 只扩展右侧，左侧保持最早时间位置（避免负数偏移）
-            self.max_time_value += time_range * 0.15
-
-        # 添加人物到场景
-        self._add_character_to_scene(ch_id, ch_name, self.next_y_offset, birth_time, death_time, org_color)
-
-        # 添加事件节点
-        for ev in character_data.get('events', []):
-            ev = dict(ev)
-            ev['character_id'] = ch_id
-            timestamp = ev.get('timestamp', 0)
-            if isinstance(timestamp, str) and re.match(r'第?\d+年\d+月\d+日', str(timestamp)):
-                time_value = parse_time_to_value(timestamp)
-                ev['base_x'] = self.LINE_START_X + (time_value - self.min_time_value) * 0.0025
-            else:
-                time_value = float(timestamp) * 10000
-                ev['base_x'] = self.LINE_START_X + (time_value - self.min_time_value) * 0.0025
-            node = EventNodeItem(ev, self.next_y_offset)
-            self.scene.addItem(node)
-            self.all_nodes.append(node)
-
-        self.next_y_offset += 160
-
-        # 更新场景矩形
-        scene_width = self.LINE_START_X + (self.max_time_value - self.min_time_value) * 0.0025 + 200
-        scene_height = max(self.next_y_offset + 100, 800)
-        self.scene.setSceneRect(0, 0, scene_width, scene_height)
-
-        # 更新已有线条的长度
-        for char_id, char_info in self.character_lines.items():
-            line_item = char_info['line']
-            line_end_x = self.LINE_START_X + (self.max_time_value - self.min_time_value) * 0.0025 + 100
-            line_item.setLine(self.LINE_START_X, char_info['y_pos'], line_end_x, char_info['y_pos'])
-
-            if 'life_line' in char_info:
-                birth_value = parse_time_to_value(char_info['birth_time'])
-                death_value = parse_time_to_value(char_info['death_time'])
-                char_info['life_line'].setLine(
-                    self.LINE_START_X + (birth_value - self.min_time_value) * 0.0025, char_info['y_pos'],
-                    self.LINE_START_X + (death_value - self.min_time_value) * 0.0025, char_info['y_pos']
-                )
-
-        # 更新已有节点位置
-        for node in self.all_nodes:
-            timestamp = node.data.get('timestamp', 0)
-            if isinstance(timestamp, str) and re.match(r'第?\d+年\d+月\d+日', str(timestamp)):
-                time_value = parse_time_to_value(timestamp)
-                new_x = self.LINE_START_X + (time_value - self.min_time_value) * 0.0025
-            else:
-                time_value = float(timestamp) * 10000
-                new_x = self.LINE_START_X + (time_value - self.min_time_value) * 0.0025
-            node.setPos(new_x, node.y_pos)
-            node.x_pos = new_x
-
-        if self.align_events:
-            self.align_synchronized_events()
-
-        self.update_viewport_virtualization()
-        return True
+    def clear_all_characters(self):
+        for char_id in list(self.character_lines.keys()):
+            self.remove_character(char_id)
+        self.next_y_offset = 80
 
     def mousePressEvent(self, event):
-        """处理鼠标点击事件：点击节点或人物轴线时发出选择信号"""
         pos = self.mapToScene(event.pos())
         items = self.scene.items(pos)
 
-        # 优先查找 EventNodeItem
         for item in items:
             if isinstance(item, EventNodeItem):
-                # 清除其他选中状态
                 for node in self.all_nodes:
                     node.setSelected(False)
                 item.setSelected(True)
@@ -656,7 +573,6 @@ class VirtualTimelineCanvas(QGraphicsView):
                 super().mousePressEvent(event)
                 return
 
-        # 如果没有点击到节点，检查是否点击到人物轴线区域
         for char_id, char_info in self.character_lines.items():
             y_pos = char_info['y_pos']
             if abs(pos.y() - y_pos) < 20:
@@ -667,15 +583,11 @@ class VirtualTimelineCanvas(QGraphicsView):
         super().mousePressEvent(event)
 
     def show_context_menu(self, pos):
-        """显示右键菜单"""
-        from PySide6.QtWidgets import QMenu
-
         pos_scene = self.mapToScene(pos)
         items = self.scene.items(pos_scene)
 
         menu = QMenu()
 
-        # 检查是否点击到事件节点
         for item in items:
             if isinstance(item, EventNodeItem):
                 self.context_menu_node = item.data
@@ -686,37 +598,39 @@ class VirtualTimelineCanvas(QGraphicsView):
                 menu.exec_(self.mapToGlobal(pos))
                 return
 
-        # 检查是否点击到人物轴线
         for char_id, char_info in self.character_lines.items():
             y_pos = char_info['y_pos']
             if abs(pos_scene.y() - y_pos) < 20:
                 self.context_menu_char_id = char_id
                 edit_action = menu.addAction(f"编辑人物「{char_info['name']}」")
                 edit_action.triggered.connect(lambda: self.character_edit_requested.emit(char_id, char_info['name']))
+                remove_action = menu.addAction(f"移除人物「{char_info['name']}」时间轴")
+                remove_action.triggered.connect(lambda: self.remove_character(char_id))
                 menu.exec_(self.mapToGlobal(pos))
                 return
 
-        # 空菜单（没有选中任何元素）
         add_event_action = menu.addAction("添加事件...")
         add_event_action.triggered.connect(self._add_event_at_position)
+        
+        if self.character_lines:
+            clear_action = menu.addAction("清空所有时间轴")
+            clear_action.triggered.connect(self.clear_all_characters)
+        
         menu.exec_(self.mapToGlobal(pos))
 
     def _delete_event_node(self, event_data):
-        """删除事件节点"""
         event_id = event_data.get('id')
         if event_id:
-            self.scene.removeItem([n for n in self.all_nodes if n.data.get('id') == event_id][0])
-            self.all_nodes = [n for n in self.all_nodes if n.data.get('id') != event_id]
-            if self.align_events:
-                self.align_synchronized_events()
+            node_to_rm = [n for n in self.all_nodes if n.data.get('id') == event_id][0]
+            self.scene.removeItem(node_to_rm)
+            self.all_nodes.remove(node_to_rm)
+            self.recalculate_layout()
             self.update_viewport_virtualization()
 
     def _add_event_at_position(self):
-        """在空白区域右键添加事件"""
-        pass  # 由主窗口处理
+        pass  
 
     def wheelEvent(self, event: QWheelEvent):
-        # Ctrl + 滚轮：缩放
         if event.modifiers() & Qt.ControlModifier:
             zoom_in_factor = 1.15
             zoom_out_factor = 1 / zoom_in_factor
@@ -733,7 +647,6 @@ class VirtualTimelineCanvas(QGraphicsView):
             self.update_viewport_virtualization()
             event.accept()
         else:
-            # 纯滚轮：左右滑动
             delta = event.angleDelta().x() if event.angleDelta().x() != 0 else event.angleDelta().y()
             scroll_amount = -delta * 3
             self.horizontalScrollBar().setValue(
@@ -742,7 +655,6 @@ class VirtualTimelineCanvas(QGraphicsView):
             event.accept()
 
     def set_scale(self, target_scale: float):
-        """设置目标缩放级别"""
         target_scale = max(self.min_scale, min(self.max_scale, target_scale))
         if self.scale_factor == 0:
             self.scale_factor = 1.0

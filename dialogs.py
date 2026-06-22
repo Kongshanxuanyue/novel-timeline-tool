@@ -2360,7 +2360,7 @@ class EditPlotThreadDialog(QDialog):
         self.thread = self.db.get_plot_thread(thread_id)
         
         self.setWindowTitle("编辑线索")
-        self.resize(400, 350)
+        self.resize(500, 500)
         
         layout = QVBoxLayout(self)
         
@@ -2408,6 +2408,49 @@ class EditPlotThreadDialog(QDialog):
         self.desc_edit.setPlainText(self.thread.get('description', ''))
         layout.addWidget(self.desc_edit)
         
+        # 起始事件
+        start_layout = QHBoxLayout()
+        start_layout.addWidget(QLabel("起始事件:"))
+        self.start_event_label = QLabel("未设置")
+        self.start_event_label.setStyleSheet("color: #6B7280;")
+        start_layout.addWidget(self.start_event_label)
+        self.select_start_btn = QPushButton("选择")
+        self.clear_start_btn = QPushButton("清除")
+        start_layout.addWidget(self.select_start_btn)
+        start_layout.addWidget(self.clear_start_btn)
+        layout.addLayout(start_layout)
+        self.start_event_id = None
+        
+        # 终止事件
+        end_layout = QHBoxLayout()
+        end_layout.addWidget(QLabel("终止事件:"))
+        self.end_event_label = QLabel("未设置")
+        self.end_event_label.setStyleSheet("color: #6B7280;")
+        end_layout.addWidget(self.end_event_label)
+        self.select_end_btn = QPushButton("选择")
+        self.clear_end_btn = QPushButton("清除")
+        end_layout.addWidget(self.select_end_btn)
+        end_layout.addWidget(self.clear_end_btn)
+        layout.addLayout(end_layout)
+        self.end_event_id = None
+        
+        # 经过事件
+        layout.addWidget(QLabel("经过事件:"))
+        self.middle_events_list = QListWidget()
+        self.middle_events_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.middle_events_list.setMaximumHeight(120)
+        layout.addWidget(self.middle_events_list)
+        
+        middle_btn_layout = QHBoxLayout()
+        self.add_middle_btn = QPushButton("添加经过事件")
+        self.remove_middle_btn = QPushButton("移除选中")
+        middle_btn_layout.addWidget(self.add_middle_btn)
+        middle_btn_layout.addWidget(self.remove_middle_btn)
+        layout.addLayout(middle_btn_layout)
+        
+        # 加载已有关联事件
+        self._load_existing_events()
+        
         # 按钮
         btn_layout = QHBoxLayout()
         self.save_btn = QPushButton("保存")
@@ -2422,6 +2465,102 @@ class EditPlotThreadDialog(QDialog):
         self.save_btn.clicked.connect(self._save)
         self.delete_btn.clicked.connect(self._delete)
         self.cancel_btn.clicked.connect(self.reject)
+        self.select_start_btn.clicked.connect(self._select_start_event)
+        self.clear_start_btn.clicked.connect(self._clear_start_event)
+        self.select_end_btn.clicked.connect(self._select_end_event)
+        self.clear_end_btn.clicked.connect(self._clear_end_event)
+        self.add_middle_btn.clicked.connect(self._add_middle_event)
+        self.remove_middle_btn.clicked.connect(self._remove_middle_event)
+    
+    def _load_existing_events(self):
+        """加载已关联的事件"""
+        thread_events = self.db.get_thread_events(self.thread_id)
+        for ev in thread_events:
+            relation_type = ev.get('relation_type', 0)
+            ev_id = ev['event_id']
+            ev_title = ev.get('title', '')
+            ev_time = ev.get('timestamp', '')
+            ev_char = ev.get('character_name', '')
+            
+            if relation_type == 0:
+                self.start_event_id = ev_id
+                self.start_event_label.setText(f"[{ev_time}] {ev_title} ({ev_char})")
+                self.start_event_label.setStyleSheet("color: #10B981;")
+            elif relation_type == 1:
+                self.end_event_id = ev_id
+                self.end_event_label.setText(f"[{ev_time}] {ev_title} ({ev_char})")
+                self.end_event_label.setStyleSheet("color: #EF4444;")
+            elif relation_type == 2:
+                item = QListWidgetItem(f"[{ev_time}] {ev_title} ({ev_char})")
+                item.setData(Qt.UserRole, ev_id)
+                self.middle_events_list.addItem(item)
+    
+    def _get_exclude_ids(self):
+        """获取已选择的事件ID集合"""
+        exclude_ids = set()
+        if self.start_event_id:
+            exclude_ids.add(self.start_event_id)
+        if self.end_event_id:
+            exclude_ids.add(self.end_event_id)
+        for i in range(self.middle_events_list.count()):
+            item = self.middle_events_list.item(i)
+            ev_id = item.data(Qt.UserRole)
+            if ev_id:
+                exclude_ids.add(ev_id)
+        return exclude_ids
+    
+    def _select_start_event(self):
+        """选择起始事件"""
+        exclude_ids = self._get_exclude_ids()
+        dialog = SelectEventByCharacterDialog(self.db, exclude_ids, self)
+        if dialog.exec() == QDialog.Accepted and dialog.selected_event_id:
+            ev = self.db.get_event(dialog.selected_event_id)
+            if ev:
+                self.start_event_id = ev['id']
+                char_name = ev.get('character_name', '')
+                self.start_event_label.setText(f"[{ev.get('timestamp', '')}] {ev.get('title', '')} ({char_name})")
+                self.start_event_label.setStyleSheet("color: #10B981;")
+    
+    def _clear_start_event(self):
+        """清除起始事件"""
+        self.start_event_id = None
+        self.start_event_label.setText("未设置")
+        self.start_event_label.setStyleSheet("color: #6B7280;")
+    
+    def _select_end_event(self):
+        """选择终止事件"""
+        exclude_ids = self._get_exclude_ids()
+        dialog = SelectEventByCharacterDialog(self.db, exclude_ids, self)
+        if dialog.exec() == QDialog.Accepted and dialog.selected_event_id:
+            ev = self.db.get_event(dialog.selected_event_id)
+            if ev:
+                self.end_event_id = ev['id']
+                char_name = ev.get('character_name', '')
+                self.end_event_label.setText(f"[{ev.get('timestamp', '')}] {ev.get('title', '')} ({char_name})")
+                self.end_event_label.setStyleSheet("color: #EF4444;")
+    
+    def _clear_end_event(self):
+        """清除终止事件"""
+        self.end_event_id = None
+        self.end_event_label.setText("未设置")
+        self.end_event_label.setStyleSheet("color: #6B7280;")
+    
+    def _add_middle_event(self):
+        """添加经过事件"""
+        exclude_ids = self._get_exclude_ids()
+        dialog = SelectEventByCharacterDialog(self.db, exclude_ids, self)
+        if dialog.exec() == QDialog.Accepted and dialog.selected_event_id:
+            ev = self.db.get_event(dialog.selected_event_id)
+            if ev:
+                char_name = ev.get('character_name', '')
+                item = QListWidgetItem(f"[{ev.get('timestamp', '')}] {ev.get('title', '')} ({char_name})")
+                item.setData(Qt.UserRole, ev['id'])
+                self.middle_events_list.addItem(item)
+    
+    def _remove_middle_event(self):
+        """移除选中的经过事件"""
+        for item in self.middle_events_list.selectedItems():
+            self.middle_events_list.takeItem(self.middle_events_list.row(item))
     
     def _save(self):
         name = self.name_edit.text().strip()
@@ -2435,6 +2574,25 @@ class EditPlotThreadDialog(QDialog):
         description = self.desc_edit.toPlainText().strip() or None
         
         self.db.update_plot_thread(self.thread_id, name, description, category, status, importance)
+        
+        # 清除旧的事件关联
+        self.db.clear_thread_events(self.thread_id)
+        
+        # 添加起始事件
+        if self.start_event_id:
+            self.db.link_event_to_thread(self.thread_id, self.start_event_id, 0)
+        
+        # 添加终止事件
+        if self.end_event_id:
+            self.db.link_event_to_thread(self.thread_id, self.end_event_id, 1)
+        
+        # 添加经过事件
+        for i in range(self.middle_events_list.count()):
+            item = self.middle_events_list.item(i)
+            ev_id = item.data(Qt.UserRole)
+            if ev_id:
+                self.db.link_event_to_thread(self.thread_id, ev_id, 2)
+        
         self.accept()
     
     def _delete(self):
@@ -2445,6 +2603,115 @@ class EditPlotThreadDialog(QDialog):
         )
         if reply == QMessageBox.Yes:
             self.db.delete_plot_thread(self.thread_id)
+            self.accept()
+
+
+class SelectEventByCharacterDialog(QDialog):
+    """按人物选择事件的对话框 - 先选组织/人物，再选事件"""
+    
+    def __init__(self, db_manager, exclude_ids=None, parent=None):
+        super().__init__(parent)
+        self.db = db_manager
+        self.exclude_ids = exclude_ids or set()
+        self.selected_event_id = None
+        
+        self.setWindowTitle("选择事件")
+        self.resize(600, 450)
+        
+        layout = QVBoxLayout(self)
+        
+        # 组织选择
+        layout.addWidget(QLabel("选择组织:"))
+        self.org_combo = QComboBox()
+        self.org_combo.addItem("全部组织", None)
+        orgs = self.db.get_all_organizations()
+        for org in orgs:
+            self.org_combo.addItem(org['name'], org['id'])
+        layout.addWidget(self.org_combo)
+        
+        # 人物选择
+        layout.addWidget(QLabel("选择人物:"))
+        self.char_combo = QComboBox()
+        self.char_combo.addItem("全部人物", None)
+        self._load_characters(None)
+        layout.addWidget(self.char_combo)
+        
+        # 事件列表
+        layout.addWidget(QLabel("选择事件:"))
+        self.event_list = QListWidget()
+        self._load_events()
+        layout.addWidget(self.event_list)
+        
+        # 按钮
+        btn_layout = QHBoxLayout()
+        self.ok_btn = QPushButton("确定")
+        self.cancel_btn = QPushButton("取消")
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.ok_btn)
+        btn_layout.addWidget(self.cancel_btn)
+        layout.addLayout(btn_layout)
+        
+        self.org_combo.currentIndexChanged.connect(self._on_org_changed)
+        self.char_combo.currentIndexChanged.connect(self._load_events)
+        self.ok_btn.clicked.connect(self._ok)
+        self.cancel_btn.clicked.connect(self.reject)
+    
+    def _load_characters(self, org_id):
+        """根据组织加载人物"""
+        self.char_combo.clear()
+        self.char_combo.addItem("全部人物", None)
+        
+        if org_id is None:
+            chars = self.db.get_all_characters()
+        else:
+            chars = self.db.get_characters_by_organization(org_id)
+        
+        for ch in chars:
+            self.char_combo.addItem(ch['name'], ch['id'])
+    
+    def _on_org_changed(self):
+        """组织改变时重新加载人物"""
+        org_id = self.org_combo.currentData()
+        self._load_characters(org_id)
+        self._load_events()
+    
+    def _load_events(self):
+        """根据筛选条件加载事件"""
+        self.event_list.clear()
+        
+        org_id = self.org_combo.currentData()
+        char_id = self.char_combo.currentData()
+        
+        all_events = self.db.get_all_events()
+        
+        for ev in all_events:
+            # 排除已关联的事件
+            if ev['id'] in self.exclude_ids:
+                continue
+            
+            # 组织筛选
+            if org_id is not None:
+                ev_char_org = ev.get('organization_id')
+                if ev_char_org != org_id:
+                    continue
+            
+            # 人物筛选
+            if char_id is not None:
+                if ev.get('character_id') != char_id:
+                    continue
+            
+            char_name = ev.get('character_name', '')
+            timestamp = ev.get('timestamp', '')
+            title = ev.get('title', '')
+            
+            item = QListWidgetItem(f"[{timestamp}] {title} ({char_name})")
+            item.setData(Qt.UserRole, ev['id'])
+            self.event_list.addItem(item)
+    
+    def _ok(self):
+        selected = self.event_list.selectedItems()
+        if selected:
+            self.selected_event_id = selected[0].data(Qt.UserRole)
             self.accept()
 
 
@@ -2474,9 +2741,9 @@ class LinkEventToThreadDialog(StyledDialog):
         # 关系类型
         layout.addWidget(QLabel("关联类型:"))
         self.relation_combo = QComboBox()
-        self.relation_combo.addItem("埋设", 0)
-        self.relation_combo.addItem("推进", 1)
-        self.relation_combo.addItem("回收", 2)
+        self.relation_combo.addItem("起始事件", 0)
+        self.relation_combo.addItem("终止事件", 1)
+        self.relation_combo.addItem("经过事件", 2)
         self.relation_combo.addItem("提及", 3)
         layout.addWidget(self.relation_combo)
         

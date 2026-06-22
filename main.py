@@ -23,6 +23,7 @@ from dialogs import (
 )
 from tree_model import OrgTreeModel
 from export_utils import export_to_json, export_to_markdown, export_to_csv
+from action_log import ActionLogManager
 from import_utils import import_from_json, export_all_to_json
 from chapter_board import ChapterBoardPanel
 from org_relation_graph import OrgRelationGraphPanel
@@ -52,6 +53,16 @@ class NovelTimelineMainWindow(QMainWindow):
         
         self.init_menu_bar()
         self.init_ui_layout()
+        
+        # 初始化操作日志管理器（最多保存10条）
+        self.action_log = ActionLogManager(max_size=10)
+        self.action_log.set_db(self.db)
+        self.action_log.action_undone.connect(self._on_action_undone)
+        
+        # 绑定 Ctrl+Z 撤销快捷键
+        from PySide6.QtGui import QKeySequence, QShortcut
+        undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        undo_shortcut.activated.connect(self._undo_last_action)
         
         # 模拟加载一些种子测试数据
         self.load_mock_data()
@@ -469,6 +480,7 @@ class NovelTimelineMainWindow(QMainWindow):
                 organization_id=org_id, color=color,
                 birth_time=data['birth_time'], death_time=data['death_time']
             )
+            self.action_log.record('add', 'character', ch_id)
             self.canvas.add_character(ch_id, data['name'], data['birth_time'], data['death_time'], color)
             self.org_tree_model.refresh()
             self.status_bar.showMessage(f"已创建人物：{data['name']} (出生:{data['birth_time']})")
@@ -492,6 +504,7 @@ class NovelTimelineMainWindow(QMainWindow):
                 core_changes=None,
                 is_public=1
             )
+            self.action_log.record('add', 'event', ev_id)
             
             event_data = {
                 'id': ev_id,
@@ -521,7 +534,9 @@ class NovelTimelineMainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No
             )
             if reply == QMessageBox.Yes:
+                old_char = self.db.get_character_with_events(data['id'])
                 self.db.delete_character(data['id'])
+                self.action_log.record('delete', 'character', data['id'], old_data=old_char)
                 self.canvas.remove_character(data['id'])
                 self.org_tree_model.refresh()
                 self.detail_title.setText("选择人物查看详情")
@@ -543,7 +558,9 @@ class NovelTimelineMainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No
             )
             if reply == QMessageBox.Yes:
+                old_event = self.db.get_event(data['id'])
                 self.db.delete_event(data['id'])
+                self.action_log.record('delete', 'event', data['id'], old_data=old_event)
                 self.canvas.remove_event(data['id'])
                 self.status_bar.showMessage(f"已删除事件：{data['label']}")
 
@@ -596,6 +613,7 @@ class NovelTimelineMainWindow(QMainWindow):
                 return
             
             org_id = self.db.create_organization(data['name'], data['description'], data['color'])
+            self.action_log.record('add', 'organization', org_id)
             self.status_bar.showMessage(f"已创建组织：{data['name']}")
             self.org_tree_model.refresh()
 
@@ -741,7 +759,9 @@ class NovelTimelineMainWindow(QMainWindow):
         """删除组织"""
         reply = QMessageBox.question(self, "确认删除", f"确定要删除组织「{org_name}」吗？\n该操作不会删除组织内的人物，只会解除关联。", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
+            old_org = self.db.get_organization(org_id)
             self.db.delete_organization(org_id)
+            self.action_log.record('delete', 'organization', org_id, old_data=old_org)
             self.org_tree_model.refresh()
             self.reload_canvas()
             self.status_bar.showMessage(f"已删除组织：{org_name}")
@@ -783,7 +803,9 @@ class NovelTimelineMainWindow(QMainWindow):
         """删除人物"""
         reply = QMessageBox.question(self, "确认删除", f"确定要删除人物「{character_name}」吗？\n该人物的所有事件也会被一并删除。", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
+            old_char = self.db.get_character_with_events(character_id)
             self.db.delete_character(character_id)
+            self.action_log.record('delete', 'character', character_id, old_data=old_char)
             self.org_tree_model.refresh()
             self.reload_canvas()
             self.status_bar.showMessage(f"已删除人物：{character_name}")
@@ -847,13 +869,16 @@ class NovelTimelineMainWindow(QMainWindow):
             if data['delete_requested']:
                 reply = QMessageBox.question(self, "确认删除", f"确定要删除事件「{event_data['title']}」吗？", QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.Yes:
+                    old_event = self.db.get_event(event_data['id'])
                     self.db.delete_event(event_data['id'])
+                    self.action_log.record('delete', 'event', event_data['id'], old_data=old_event)
                     self.status_bar.showMessage(f"已删除事件：{event_data['title']}")
                     self.reload_canvas()
             else:
                 if not data['title']:
                     QMessageBox.warning(self, "提示", "请输入事件标题")
                     return
+                old_event = self.db.get_event(event_data['id'])
                 self.db.update_event(
                     event_data['id'],
                     title=data['title'],
@@ -862,6 +887,7 @@ class NovelTimelineMainWindow(QMainWindow):
                     color=data['color'],
                     content=data['content']
                 )
+                self.action_log.record('update', 'event', event_data['id'], old_data=old_event)
                 self.status_bar.showMessage(f"已保存事件：{data['title']}")
                 self.reload_canvas()
 
@@ -873,7 +899,9 @@ class NovelTimelineMainWindow(QMainWindow):
             if data['delete_requested']:
                 reply = QMessageBox.question(self, "确认删除", f"确定要删除人物「{self.db.get_character(character_id)['name']}」吗？\n该人物的所有事件也会被一并删除。", QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.Yes:
+                    old_char = self.db.get_character_with_events(character_id)
                     self.db.delete_character(character_id)
+                    self.action_log.record('delete', 'character', character_id, old_data=old_char)
                     self.status_bar.showMessage(f"已删除人物：{self.db.get_character(character_id)['name']}")
                     self.reload_canvas()
                     self.org_tree_model.refresh()
@@ -881,6 +909,7 @@ class NovelTimelineMainWindow(QMainWindow):
                 if not data['name']:
                     QMessageBox.warning(self, "提示", "请输入人物名称")
                     return
+                old_char = self.db.get_character(character_id)
                 self.db.update_character(
                     character_id,
                     name=data['name'],
@@ -890,21 +919,29 @@ class NovelTimelineMainWindow(QMainWindow):
                     birth_time=data['birth_time'],
                     death_time=data['death_time']
                 )
+                self.action_log.record('update', 'character', character_id, old_data=old_char)
                 self.status_bar.showMessage(f"已保存人物：{data['name']}")
                 self.reload_canvas()
                 self.org_tree_model.refresh()
 
     def reload_canvas(self):
-        """重新加载画布数据"""
-        characters = self.db.get_all_characters()
+        """重新加载画布数据（只重新加载当前画布上已有的人物）"""
+        current_char_ids = list(self.canvas.character_lines.keys())
+        if not current_char_ids:
+            return
+
         canvas_data = []
-        for ch in characters:
-            ch_with_events = self.db.get_character_with_events(ch['id'])
+        for char_id in current_char_ids:
+            ch = self.db.get_character(char_id)
+            if not ch:
+                continue
+            ch_with_events = self.db.get_character_with_events(char_id)
             if ch_with_events:
                 org = self.db.get_organization(ch['organization_id']) if ch.get('organization_id') else None
                 ch_with_events['org_id'] = ch.get('organization_id', 0)
                 ch_with_events['org_color'] = org['color'] if org else None
                 canvas_data.append(ch_with_events)
+
         if canvas_data:
             self.canvas.load_timeline_data(canvas_data)
         else:
@@ -913,10 +950,39 @@ class NovelTimelineMainWindow(QMainWindow):
             self.canvas.character_lines.clear()
             self.canvas.character_name_items.clear()
         
-        # 同步刷新关系图
         self.org_relation_graph.refresh_graph()
         self.char_relation_graph.refresh_graph()
         self.plot_thread_board.refresh()
+
+    # ==================== 撤销功能 ====================
+    def _undo_last_action(self):
+        """撤销最近一条操作（Ctrl+Z）"""
+        if not self.action_log.can_undo():
+            self.status_bar.showMessage("没有可撤销的操作")
+            return
+        desc = self.action_log.get_undo_description()
+        entity_type = self.action_log.undo()
+        if entity_type:
+            self.status_bar.showMessage(f"已{desc}")
+            self._refresh_after_undo(entity_type)
+        else:
+            self.status_bar.showMessage("撤销失败")
+
+    def _on_action_undone(self, entity_type):
+        """撤销完成后的回调"""
+        pass
+
+    def _refresh_after_undo(self, entity_type):
+        """根据撤销的实体类型刷新对应界面"""
+        self.reload_canvas()
+        self.org_tree_model.refresh()
+        self.org_relation_graph.refresh_graph()
+        self.char_relation_graph.refresh_graph()
+        self.plot_thread_board.refresh()
+        self.chapter_board.refresh()
+        self.inspiration_panel.refresh()
+        if hasattr(self, 'event_group_panel'):
+            self.event_group_panel.refresh()
 
     # ==================== 导出功能 ====================
     def _show_export_options(self):
@@ -976,10 +1042,11 @@ class NovelTimelineMainWindow(QMainWindow):
                 QMessageBox.warning(self, "提示", "请输入章节标题")
                 return
             
-            self.db.create_chapter(
+            chapter_id = self.db.create_chapter(
                 data['number'], data['title'], data['summary'],
                 data['word_count'], data['status']
             )
+            self.action_log.record('add', 'chapter', chapter_id)
             
             for ev_id in data['event_ids']:
                 self.db.bind_event_to_chapter(ev_id, data['number'], data['title'])
@@ -1001,9 +1068,12 @@ class NovelTimelineMainWindow(QMainWindow):
         if dialog.exec() == EditChapterDialog.Accepted:
             data = dialog.get_chapter_data()
             if data['delete_requested']:
+                old_chapter = self.db.get_chapter(chapter_id)
                 self.db.delete_chapter(chapter_id)
+                self.action_log.record('delete', 'chapter', chapter_id, old_data=old_chapter)
                 self.status_bar.showMessage("章节已删除")
             else:
+                old_chapter = self.db.get_chapter(chapter_id)
                 self.db.update_chapter(
                     chapter_id,
                     number=data['number'],
@@ -1012,6 +1082,7 @@ class NovelTimelineMainWindow(QMainWindow):
                     word_count=data['word_count'],
                     status=data['status']
                 )
+                self.action_log.record('update', 'chapter', chapter_id, old_data=old_chapter)
                 self.status_bar.showMessage(f"已保存第{data['number']}章")
             self.chapter_board.refresh()
             self.reload_canvas()
@@ -1059,10 +1130,11 @@ class NovelTimelineMainWindow(QMainWindow):
                 QMessageBox.warning(self, "提示", "请输入章节标题")
                 return
             
-            self.db.create_chapter(
+            chapter_id = self.db.create_chapter(
                 data['number'], data['title'], data['summary'],
                 data['word_count'], data['status']
             )
+            self.action_log.record('add', 'chapter', chapter_id)
             
             for ev_id in data['event_ids']:
                 self.db.bind_event_to_chapter(ev_id, data['number'], data['title'])
@@ -1239,6 +1311,10 @@ class NovelTimelineMainWindow(QMainWindow):
         from dialogs import AddPlotThreadDialog
         dialog = AddPlotThreadDialog(self.db, self)
         if dialog.exec() == QDialog.Accepted:
+            threads = self.db.get_all_plot_threads()
+            if threads:
+                thread_id = max(t['id'] for t in threads)
+                self.action_log.record('add', 'plot_thread', thread_id)
             self.plot_thread_board.refresh()
             self.status_bar.showMessage("线索已创建")
     
@@ -1287,6 +1363,24 @@ class NovelTimelineMainWindow(QMainWindow):
         dialog.content_edit.setPlainText(insp.get('content', ''))
         
         if dialog.exec() == QDialog.Accepted:
+            data = dialog.get_event_data()
+            if not data['title']:
+                QMessageBox.warning(self, "提示", "请输入事件标题")
+                return
+            
+            ev_id = self.db.create_event(
+                character_id=data['character_id'],
+                timestamp=data['timestamp'],
+                title=data['title'],
+                content=data['content'],
+                type=data['type'],
+                color=data['color'],
+                tags=None,
+                core_changes=None,
+                is_public=1
+            )
+            self.action_log.record('add', 'event', ev_id)
+            
             # 标记灵感为已使用
             self.db.update_inspiration(insp_id, is_used=1)
             self.inspiration_panel.refresh()
@@ -1313,6 +1407,10 @@ class NovelTimelineMainWindow(QMainWindow):
         """显示添加事件组对话框"""
         dialog = AddEventGroupDialog(self.db, self)
         if dialog.exec() == AddEventGroupDialog.Accepted:
+            groups = self.db.get_all_event_groups()
+            if groups:
+                group_id = max(g['id'] for g in groups)
+                self.action_log.record('add', 'event_group', group_id)
             self.event_group_panel.refresh()
             self.status_bar.showMessage("事件组已创建")
     
@@ -1338,8 +1436,19 @@ class NovelTimelineMainWindow(QMainWindow):
             dialog = AddEventGroupDialog(self.db, self)
         else:
             dialog = EditEventGroupDialog(self.db, group_id, self)
+            old_group = self.db.get_event_group(group_id)
         
         if dialog.exec() == (AddEventGroupDialog.Accepted if group_id == 0 else EditEventGroupDialog.Accepted):
+            if group_id == 0:
+                groups = self.db.get_all_event_groups()
+                if groups:
+                    group_id = max(g['id'] for g in groups)
+                    self.action_log.record('add', 'event_group', group_id)
+            else:
+                if dialog.delete_requested:
+                    self.action_log.record('delete', 'event_group', group_id, old_data=old_group)
+                else:
+                    self.action_log.record('update', 'event_group', group_id, old_data=old_group)
             self.event_group_panel.refresh()
             self.status_bar.showMessage("事件组已更新")
     
@@ -1372,7 +1481,7 @@ class NovelTimelineMainWindow(QMainWindow):
         """导入数据"""
         result = import_from_json(self, self.db)
         if result:
-            self.load_timeline_data()
+            self.reload_canvas()
             self.refresh_all_panels()
             self.status_bar.showMessage("数据导入成功，时间轴已刷新")
     

@@ -405,7 +405,7 @@ class DatabaseManager:
         """获取所有人物列表"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT id, name, alias, color FROM characters ORDER BY created_at ASC')
+            cursor.execute('SELECT id, name, alias, color, description, organization_id, birth_time, death_time FROM characters ORDER BY created_at ASC')
             return [dict(row) for row in cursor.fetchall()]
 
     def get_character(self, character_id):
@@ -413,6 +413,16 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM characters WHERE id = ?', (character_id,))
+            ch = cursor.fetchone()
+            return dict(ch) if ch else None
+
+    def get_character_by_name(self, name):
+        """根据名称获取人物信息"""
+        if not name:
+            return None
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM characters WHERE name = ? LIMIT 1', (name,))
             ch = cursor.fetchone()
             return dict(ch) if ch else None
 
@@ -530,19 +540,47 @@ class DatabaseManager:
                 (character_id,)
             )
             return [dict(row) for row in cursor.fetchall()]
-    
-    def get_all_events(self):
-        """获取所有事件"""
+
+    def get_event_by_title_and_character(self, title, character_id, timestamp=None):
+        """根据标题和人物ID查找事件，可选匹配时间戳"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT id, timestamp, title FROM events ORDER BY timestamp ASC')
+            if timestamp:
+                cursor.execute(
+                    'SELECT * FROM events WHERE title = ? AND character_id = ? AND timestamp = ? LIMIT 1',
+                    (title, character_id, timestamp)
+                )
+            else:
+                cursor.execute(
+                    'SELECT * FROM events WHERE title = ? AND character_id = ? LIMIT 1',
+                    (title, character_id)
+                )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    
+    def get_all_events(self):
+        """获取所有事件（包含人物名称和组织ID）"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT e.id, e.timestamp, e.title, e.character_id,
+                       c.name as character_name, c.organization_id
+                FROM events e
+                LEFT JOIN characters c ON e.character_id = c.id
+                ORDER BY e.timestamp ASC
+            ''')
             return [dict(row) for row in cursor.fetchall()]
 
     def get_event(self, event_id):
-        """获取单个事件"""
+        """获取单个事件（包含人物名称和组织ID）"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT * FROM events WHERE id = ?', (event_id,))
+            cursor.execute('''
+                SELECT e.*, c.name as character_name, c.organization_id
+                FROM events e
+                LEFT JOIN characters c ON e.character_id = c.id
+                WHERE e.id = ?
+            ''', (event_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
 
@@ -570,6 +608,16 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM organizations WHERE id = ?', (org_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_organization_by_name(self, name):
+        """根据名称获取组织"""
+        if not name:
+            return None
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM organizations WHERE name = ? LIMIT 1', (name,))
             row = cursor.fetchone()
             return dict(row) if row else None
 
@@ -1316,6 +1364,14 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute('DELETE FROM plot_thread_events WHERE thread_id = ? AND event_id = ?', 
                           (thread_id, event_id))
+            conn.commit()
+            return cursor.rowcount
+    
+    def clear_thread_events(self, thread_id):
+        """清除线索的所有事件关联"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM plot_thread_events WHERE thread_id = ?', (thread_id,))
             conn.commit()
             return cursor.rowcount
     
